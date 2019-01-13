@@ -1,7 +1,7 @@
 package config
 
 import (
-	"errors"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -51,10 +51,10 @@ func Load() (*Config, error) {
 	if err := c.v.ReadInConfig(); err != nil {
 		return nil, err
 	}
-	if err := c.parseV6Config(); err != nil {
+	if err := c.parseConfig(true); err != nil {
 		return nil, err
 	}
-	if err := c.parseV4Config(); err != nil {
+	if err := c.parseConfig(false); err != nil {
 		return nil, err
 	}
 	if c.Server6 == nil && c.Server4 == nil {
@@ -90,56 +90,83 @@ func parsePlugins(pluginList []interface{}) ([]*PluginConfig, error) {
 	return plugins, nil
 }
 
-func (c *Config) parseV6Config() error {
-	if exists := c.v.Get("server6"); exists == nil {
-		// it is valid to have no DHCPv6 configuration defined, so no
-		// server and no error are returned
-		return nil
+func (c *Config) getListenAddress(v6 bool) (*net.UDPAddr, error) {
+	ver := 6
+	if !v6 {
+		ver = 4
 	}
-	addr := c.v.GetString("server6.listen")
+	if exists := c.v.Get(fmt.Sprintf("server%d", ver)); exists == nil {
+		// it is valid to have no server configuration defined, and in this case
+		// no listening address and no error are returned.
+		return nil, nil
+	}
+	addr := c.v.GetString(fmt.Sprintf("server%d.listen", ver))
 	if addr == "" {
-		return ConfigErrorFromString("dhcpv6: missing `server6.listen` directive")
+		return nil, ConfigErrorFromString("dhcpv%v: missing `server%d.listen` directive", ver, ver)
 	}
 	ipStr, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
-		return ConfigErrorFromString("dhcpv6: %v", err)
+		return nil, ConfigErrorFromString("dhcpv%d: %v", ver, err)
 	}
 	ip := net.ParseIP(ipStr)
-	if ip.To4() != nil {
-		return ConfigErrorFromString("dhcpv6: missing or invalid `listen` address")
+	if v6 && ip.To4() != nil {
+		return nil, ConfigErrorFromString("dhcpv%d: missing or invalid `listen` address", ver)
+	} else if !v6 && ip.To4() == nil {
+		return nil, ConfigErrorFromString("dhcpv%d: missing or invalid `listen` address", ver)
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		return ConfigErrorFromString("dhcpv6: invalid `listen` port")
+		return nil, ConfigErrorFromString("dhcpv%d: invalid `listen` port", ver)
 	}
 	listener := net.UDPAddr{
 		IP:   ip,
 		Port: port,
 	}
-	sc := ServerConfig{
-		Listener: &listener,
-		Plugins:  nil,
-	}
-	// load plugins
+	return &listener, nil
+}
+
+func (c *Config) getPlugins(v6 bool) ([]*PluginConfig, error) {
 	pluginList := cast.ToSlice(c.v.Get("server6.plugins"))
 	if pluginList == nil {
-		return ConfigErrorFromString("dhcpv6: invalid plugins section, not a list")
+		return nil, ConfigErrorFromString("dhcpv6: invalid plugins section, not a list")
 	}
 	plugins, err := parsePlugins(pluginList)
+	if err != nil {
+		return nil, err
+	}
+	return plugins, nil
+}
+
+func (c *Config) parseConfig(v6 bool) error {
+	ver := 6
+	if !v6 {
+		ver = 4
+	}
+	listenAddr, err := c.getListenAddress(v6)
+	if err != nil {
+		return err
+	}
+	if listenAddr == nil {
+		// no listener is configured, so `c.Server6` (or `c.Server4` if v4)
+		// will stay nil.
+		return nil
+	}
+	// read plugin configuration
+	plugins, err := c.getPlugins(v6)
 	if err != nil {
 		return err
 	}
 	for _, p := range plugins {
-		log.Printf("DHCPv6: found plugin `%s` with %d args: %v", p.Name, len(p.Args), p.Args)
+		log.Printf("DHCPv%d: found plugin `%s` with %d args: %v", ver, p.Name, len(p.Args), p.Args)
 	}
-	sc.Plugins = plugins
-	c.Server6 = &sc
-	return nil
-}
-
-func (c *Config) parseV4Config() error {
-	if exists := c.v.Get("server4"); exists != nil {
-		return errors.New("DHCPv4 config parser not implemented yet")
+	sc := ServerConfig{
+		Listener: listenAddr,
+		Plugins:  plugins,
+	}
+	if v6 {
+		c.Server6 = &sc
+	} else {
+		c.Server4 = &sc
 	}
 	return nil
 }
